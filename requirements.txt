@@ -1,0 +1,9 @@
+# 本项目刻意保持零重依赖 —— 只依赖 Pydantic。
+# 这样任何人都能 clone → 跑三条命令 → 复现 README 里的全部数字。
+
+pydantic>=2.0.0
+
+# ---- 生产化替换（当前用轻量实现替代，见 README「已知边界」）----
+# asyncpg>=0.29.0        # 审批队列与轨迹落 Postgres
+# redis>=5.0.0           # 幂等账本落 Redis（多实例共享）
+# opentelemetry-sdk      # 分布式追踪（替换本地轨迹）

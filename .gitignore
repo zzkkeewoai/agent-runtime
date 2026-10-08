@@ -1,0 +1,23 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.so
+.venv/
+venv/
+env/
+
+# ---- 运行时产物（可重新生成，不入库）----
+# 审计记录与任务轨迹是运行测试/评测时生成的，不入库；
+# 评测任务集 data/eval_tasks.jsonl 是数据集，需要入库。
+data/audit.jsonl
+data/traces.jsonl
+
+# ---- IDE ----
+.vscode/
+.idea/
+*.swp
+
+# ---- 测试缓存 ----
+.pytest_cache/
+.coverage
+htmlcov/
