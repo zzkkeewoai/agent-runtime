@@ -220,6 +220,26 @@ class AgentRuntime:
         loop_threshold: int = 3,
         trace_store: Optional[TraceStore] = None,
     ):
+        # ---------- 参数下界校验（fail-fast） ----------
+        # 为什么必须在这里拦，而不是"信任调用方"：
+        #   这些参数配错时**不会报错，只会静默地做错事**，而且错的方向很隐蔽：
+        #     loop_threshold = 1 → 一次正常调用就被判成"连续 1 次相同" →
+        #         **正常任务被误杀**，steps=2 且工具一次都没执行；
+        #     loop_threshold = 0 → deque(maxlen=0) 窗口永远为空 →
+        #         **循环检测静默失效**，无限循环要跑满 max_steps 才被兜住。
+        #   两种都是实测出来的（不是推演）。合法下界是 2：
+        #     模式①「连续相同」至少需要 2 个样本；
+        #     模式②「严格周期」需要 2×threshold 个样本，threshold>=2 才有意义。
+        if loop_threshold < 2:
+            raise ValueError(
+                f"loop_threshold 必须 >= 2（收到 {loop_threshold}）："
+                f"配 1 会把一次正常调用误判成死循环，配 0 会让循环检测静默失效"
+            )
+        if max_steps < 2:
+            raise ValueError(f"max_steps 必须 >= 2（收到 {max_steps}）")
+        if token_budget <= 0:
+            raise ValueError(f"token_budget 必须 > 0（收到 {token_budget}）")
+
         self.brain = brain
         self.gateway = gateway
         self.max_steps = max_steps

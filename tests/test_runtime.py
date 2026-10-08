@@ -1,4 +1,4 @@
-"""Agent 运行时验证 —— 9 个场景，验证状态机与三个硬约束
+"""Agent 运行时验证 —— 11 个场景，验证状态机与三个硬约束
 
 覆盖：
   ① 正常任务：调工具 → 观察 → 给答案（含步状态是否正确落盘）
@@ -10,6 +10,8 @@
   ⑤ 越权工具：调用被网关拒绝 → 拒绝原因作为观察反馈给模型
   ⑥ 高危工具：触发审批 → 提示勿重复提交 → 模型给阶段性结论
   ⑦ 模型非法输出：既无动作也无答案 → 标记异常
+  ⑦b 动作格式非法：给了动作但结构不对（字符串 / tool 为 null）→ usage_error 而非崩溃
+  ⑦c 参数下界校验：loop_threshold / max_steps / token_budget 配错 → 构造时 fail-fast
   ⑧ 轨迹落盘与统计：可回放、可算指标
 
 运行：python tests/test_runtime.py
@@ -255,6 +257,36 @@ def main() -> int:
     )
 
     # ------------------------------------------------------------
+    section("⑦c 参数下界校验：配错时必须立刻报错，而不是静默做错事")
+    # 这两个参数配错时不会崩，只会**静默地做错事**，而且错的方向很隐蔽：
+    #   loop_threshold=1 → 一次正常调用就被判成"连续 1 次相同" →
+    #       正常任务被误杀，steps=2 且**工具一次都没执行**
+    #   loop_threshold=0 → deque(maxlen=0) 窗口恒空 → **循环检测静默失效**，
+    #       无限循环要跑满 max_steps 才被兜住
+    # 两种都是实测出来的。静默失败比崩溃更危险（崩溃至少能被发现），
+    # 所以正解是构造时 fail-fast。
+    def _rejects(**kwargs) -> bool:
+        try:
+            AgentRuntime(
+                brain=ScriptedBrain([{"thought": "x", "answer": "y"}]), gateway=gw, **kwargs
+            )
+            return False
+        except ValueError:
+            return True
+
+    check(
+        "loop_threshold=1 → 直接报错（否则正常任务被判死循环、工具一次都不执行）",
+        _rejects(loop_threshold=1),
+    )
+    check(
+        "loop_threshold=0 → 直接报错（否则窗口恒空、循环检测静默失效）",
+        _rejects(loop_threshold=0),
+    )
+    check("loop_threshold=2 合法（下界）", not _rejects(loop_threshold=2))
+    check("max_steps=1 → 直接报错", _rejects(max_steps=1))
+    check("token_budget=0 → 直接报错", _rejects(token_budget=0))
+
+    # ------------------------------------------------------------
     section("⑧ 轨迹落盘与统计")
     stats = trace.stats()
     check("轨迹已落盘", stats["tasks"] >= 7, f"tasks={stats['tasks']}")
@@ -264,18 +296,34 @@ def main() -> int:
           f"success_rate={stats.get('success_rate')} avg_steps={stats.get('avg_steps')}")
 
     print()
-    # 【指标解读说明】这个测试集里刻意放了 5 个异常场景，
+    # 【指标解读说明】这个测试集里刻意放了一堆异常场景，
     # 所以"整体完成率"天然很低 —— 不能拿它当系统成功率讲。
     # 正确的指标是分开看：正常场景的完成率 + 异常场景的约束触发率。
+    #
+    # 【这里踩过一个坑】原先这段是硬编码的 `print("约束触发准确率 5/5 = 100%")` ——
+    #   数字是手写死的，不是算出来的。用例后来从 5 个扩到 7 个，它照样打印 5/5，
+    #   **而且不会有任何地方报错**。指标一旦是手写的，它就迟早变成谎言。
+    #   现在改为从落盘轨迹的结束原因里真实聚合。
+    by_reason = stats.get("by_finish_reason") or {}
+    EXPECTED_CONSTRAINTS = [
+        FinishReason.LOOP_DETECTED,   # ② 连续相同调用 / ②b 交替循环
+        FinishReason.MAX_STEPS,       # ③ 步数超限
+        FinishReason.TOKEN_BUDGET,    # ④ 预算超限
+        FinishReason.NO_ACTION,       # ⑦ 既不调工具也不作答
+        FinishReason.USAGE_ERROR,     # ⑦b 给了动作但格式非法
+    ]
+    hit = [r for r in EXPECTED_CONSTRAINTS if by_reason.get(r.value, 0) > 0]
+    coverage = len(hit) / len(EXPECTED_CONSTRAINTS)
+
     print("  【场景构成】")
-    print("    · 正常场景     1 个（T-normal）            → 期望 completed")
-    print("    · 异常场景     5 个（死循环/超步数/超预算/非法输出/越权恢复）→ 期望约束正确触发")
-    print("    · 高危审批     1 个（T-approval）          → 期望挂起且不重复建单")
+    print("    · 正常场景       1 个（T-normal）  → 期望 completed")
+    print(f"    · 约束类场景     {len(EXPECTED_CONSTRAINTS)} 类"
+          f"（{'、'.join(r.value for r in EXPECTED_CONSTRAINTS)}）→ 期望被识别并优雅收尾")
+    print("    · 高危审批       1 个（T-approval）→ 期望挂起且不重复建单")
     print()
-    print("  【关键指标】")
-    print("    正常任务完成率        1/1 = 100%")
-    print("    约束触发准确率        5/5 = 100%（异常场景全部被识别并优雅收尾）")
-    print(f"    结束原因分布          {stats.get('by_finish_reason')}")
+    print("  【关键指标】（以下数字全部从落盘轨迹聚合，没有手写的常量）")
+    print(f"    约束触发覆盖率        {len(hit)}/{len(EXPECTED_CONSTRAINTS)} = {coverage:.0%}")
+    print(f"    结束原因分布          {by_reason}")
     print(f"    平均步数              {stats.get('avg_steps')}")
     print(f"    平均 token            {stats.get('avg_tokens')}")
     print(f"    平均耗时(ms)          {stats.get('avg_latency_ms')}")
