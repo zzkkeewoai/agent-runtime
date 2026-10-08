@@ -28,6 +28,19 @@ from gateway import ToolCallRequest, ToolGateway  # noqa: E402
 
 
 class AgentState(str, Enum):
+    """Agent 状态。
+
+    【ACTING 是瞬态，不会出现在落盘轨迹里】——这点必须说清楚，
+    否则会让人以为状态机漏实现了：
+        工具是同步执行的，一次调用不跨越步边界，所以"正在执行"这个状态
+        只存在于调用的那一瞬间，没有机会被写进某一步的 state 字段。
+        落盘的 state 记录的是**每一步结束时**的状态：
+            THINKING      这一步没走到动作就结束了（被预算 / 循环约束中止）
+            OBSERVING     调完工具、拿到观察，循环继续
+            DONE          模型直接给出答案，任务正常结束
+            FORCE_ANSWER  触发约束 → 进入优雅收尾
+    """
+
     THINKING = "thinking"
     ACTING = "acting"
     OBSERVING = "observing"
@@ -35,13 +48,59 @@ class AgentState(str, Enum):
     DONE = "done"
 
 
+def detect_loop(history: List[Tuple[str, str]], threshold: int) -> Tuple[bool, str]:
+    """判断工具调用序列是否已经陷入死循环。
+
+    覆盖两种模式 —— 原实现只覆盖了第一种：
+
+      ① 原地打转：连续 threshold 次**完全相同**的调用
+      ② 周期性交替：A,B,A,B... —— 窗口里签名种类不止一种，但序列严格周期重复
+
+    【为什么第二种必须单独判】
+        原实现的判定条件是 `len(set(recent_calls)) == 1`，
+        也就是说：只要窗口里出现第二种签名，判定就永远不成立。
+        于是一个在两个工具之间来回摇摆的 Agent（什么都没推进）
+        会一路跑满 max_steps 才停下 —— 中间烧掉的每一次调用和 token 全是白费。
+        这类循环在真实系统里很常见：模型"查一下 A，发现要看 B，查完 B 又觉得该看 A"。
+
+    为什么要求**严格周期**，而不是"签名种类少就算"：
+        正常的多步任务也会反复用同几个工具。
+        只有序列严格按周期重复（window[i] == window[i-period] 对全部 i 成立），
+        才说明它没有任何推进。判得太宽松会把正常任务误杀。
+
+    签名里包含**完整参数**，所以"对不同实体做同样的操作"（args 不同）
+    本来就是不同签名，天然不会被误判成循环。
+    """
+    items = list(history)
+    if len(items) < threshold:
+        return False, ""
+
+    # ① 原地打转
+    tail = items[-threshold:]
+    if len(set(tail)) == 1:
+        return True, f"连续 {threshold} 次完全相同的调用（{tail[0][0]}）"
+
+    # ② 周期性交替（至少要凑够 2 个周期才够判）
+    span = threshold * 2
+    if len(items) >= span:
+        window = items[-span:]
+        for period in range(1, threshold + 1):
+            if all(window[i] == window[i - period] for i in range(period, len(window))):
+                names = "→".join(dict.fromkeys(w[0] for w in window[:period]))
+                return (
+                    True,
+                    f"检测到周期为 {period} 的重复调用序列（{names}），该循环没有推进任何信息",
+                )
+    return False, ""
+
+
 class FinishReason(str, Enum):
     ANSWERED = "answered"            # 正常给出答案
-    NO_ACTION = "no_action"          # 模型既不调工具也不作答（异常）
+    NO_ACTION = "no_action"          # 模型既没调工具也没作答（什么都没给）
     MAX_STEPS = "max_steps"          # 步数超限 → 已优雅收尾
     TOKEN_BUDGET = "token_budget"    # 预算超限 → 已优雅收尾
     LOOP_DETECTED = "loop_detected"  # 重复调用卡死 → 已优雅收尾
-    USAGE_ERROR = "usage_error"      # 模型给出了非法动作
+    USAGE_ERROR = "usage_error"      # 给了动作但格式非法（非 dict / 缺 tool 字段）
 
 
 @dataclass
@@ -179,7 +238,9 @@ class AgentRuntime:
         total_tokens = 0
         reason = FinishReason.ANSWERED
         answer: Optional[str] = None
-        recent_calls: Deque[Tuple[str, str]] = deque(maxlen=self.loop_threshold)
+        # 窗口开到 2 倍阈值：判定"周期为 2 的交替"至少需要 4 个样本，
+        # 窗口只留 threshold 个会漏掉 A,B,A,B 这类循环（这正是原实现的缺口）
+        recent_calls: Deque[Tuple[str, str]] = deque(maxlen=self.loop_threshold * 2)
 
         for step_index in range(self.max_steps):
             t_step = time.time()
@@ -207,24 +268,39 @@ class AgentRuntime:
                 step.observation = "(模型直接作答)"
                 step.latency_ms = round((time.time() - t_step) * 1000, 2)
                 steps.append(step)
+                step.state = AgentState.DONE.value
                 reason = FinishReason.ANSWERED
                 break
 
-            # 既没动作也没答案 → 认为模型输出非法
+            # 既没动作也没答案 → 模型什么都没给
             if not decision.action:
                 step.latency_ms = round((time.time() - t_step) * 1000, 2)
                 steps.append(step)
                 reason = FinishReason.NO_ACTION
                 break
 
-            tool_name = decision.action.get("tool", "")
-            args = decision.action.get("args", {}) or {}
+            # 有动作但格式非法 → 必须先校验再取字段。
+            # 直接写 `decision.action.get("tool", "")` 是有风险的：
+            # 真实 LLM 完全可能吐出 action="query_order"（字符串）或 {"tool": null}，
+            # 那时 .get() 会抛 AttributeError，把整个任务崩掉 ——
+            # 而"模型输出格式不对"恰恰是 Agent 最常见的失败之一，必须优雅处理。
+            action = decision.action
+            if not isinstance(action, dict) or not action.get("tool"):
+                step.observation = "(模型输出的动作格式非法：action 必须是含 tool 字段的对象)"
+                step.latency_ms = round((time.time() - t_step) * 1000, 2)
+                steps.append(step)
+                reason = FinishReason.USAGE_ERROR
+                break
+
+            tool_name = str(action["tool"])
+            args = action.get("args", {}) or {}
 
             # ---------- 死循环检测 ----------
             signature = (tool_name, json.dumps(args, sort_keys=True, ensure_ascii=False))
             recent_calls.append(signature)
-            if len(recent_calls) == self.loop_threshold and len(set(recent_calls)) == 1:
-                step.observation = f"(检测到连续 {self.loop_threshold} 次相同调用: {tool_name})"
+            looped, why = detect_loop(list(recent_calls), self.loop_threshold)
+            if looped:
+                step.observation = f"(检测到死循环，已中止: {why})"
                 step.latency_ms = round((time.time() - t_step) * 1000, 2)
                 steps.append(step)
                 reason = FinishReason.LOOP_DETECTED
@@ -255,6 +331,8 @@ class AgentRuntime:
             )
             observations.append(observation)
             step.observation = self._render_observation(result)
+            # 这一步走完了「动作 + 观察」，落盘为 OBSERVING（循环继续）
+            step.state = AgentState.OBSERVING.value
             step.latency_ms = round((time.time() - t_step) * 1000, 2)
             steps.append(step)
         else:

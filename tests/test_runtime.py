@@ -1,8 +1,10 @@
-"""Agent 运行时验证 —— 8 个场景，验证状态机与三个硬约束
+"""Agent 运行时验证 —— 9 个场景，验证状态机与三个硬约束
 
 覆盖：
-  ① 正常任务：调工具 → 观察 → 给答案
+  ① 正常任务：调工具 → 观察 → 给答案（含步状态是否正确落盘）
   ② 死循环：反复调同一工具 → 被检测 → 优雅收尾
+  ②b 交替循环：A,B,A,B... → 被检测（**原实现漏判**：判定条件只看"窗口内签名是否全同"，
+      只要出现第二种签名就永远不成立，于是这种循环会一路跑满 max_steps）+ 反向验证不误判
   ③ 步数超限：一直调不同工具 → 达上限 → 优雅收尾
   ④ 预算超限：token 累积超预算 → 优雅收尾
   ⑤ 越权工具：调用被网关拒绝 → 拒绝原因作为观察反馈给模型
@@ -72,6 +74,10 @@ def main() -> int:
     check("产生了 1 次工具调用", run.tool_calls == 1, f"tool_calls={run.tool_calls}")
     check("轨迹包含思考+动作", run.step_count == 2, f"steps={run.step_count}")
     check("最终答案非空", bool(run.final_answer), (run.final_answer or "")[:40])
+    # 步状态落盘：原来 AgentState 定义了 5 个状态，但只写入 THINKING 一个，
+    # DONE / OBSERVING 从没被赋值过 —— 轨迹回放时看不出每步在做什么。
+    check("步状态落盘：调完工具那步是 observing", run.steps[0].state == "observing", run.steps[0].state)
+    check("步状态落盘：给出答案那步是 done", run.steps[1].state == "done", run.steps[1].state)
 
     # ------------------------------------------------------------
     section("② 死循环：反复调同一工具 → 被检测并优雅收尾")
@@ -87,6 +93,69 @@ def main() -> int:
     check("没有跑满 max_steps 就中止", run.step_count < 10, f"steps={run.step_count}")
     check("仍然产出了收尾结论（优雅降级）", bool(run.final_answer), (run.final_answer or "")[:50])
     check("状态为 aborted", run.status == "aborted", run.status)
+
+    # ------------------------------------------------------------
+    section("②b 交替循环：A,B,A,B...（原实现漏判的场景）")
+    # 原实现的条件是 `len(set(recent_calls)) == 1` ——
+    # 只要窗口里出现第二种签名，条件就永远不成立。
+    # 于是一个"在两个工具之间来回摇摆、什么都没推进"的 Agent
+    # 会一路跑满 max_steps 才停，中间烧掉的调用和 token 全是白费。
+    # 这里用「同一个工具 + 两个不同订单号」交替，构造严格周期序列。
+    alt_steps = []
+    for _ in range(4):
+        alt_steps.append(
+            {
+                "thought": "查 A 订单",
+                "action": {"tool": "query_order", "args": {"order_id": "ORD-000123"}},
+            }
+        )
+        alt_steps.append(
+            {
+                "thought": "查 B 订单",
+                "action": {"tool": "query_order", "args": {"order_id": "ORD-000124"}},
+            }
+        )
+    rt = AgentRuntime(
+        ScriptedBrain(alt_steps),
+        gw,
+        max_steps=10,
+        token_budget=99999,
+        loop_threshold=3,
+        trace_store=trace,
+    )
+    run_alt = rt.run("来回查两个订单", role=ROLE_READER, task_id="T-alt-loop")
+    check(
+        "交替循环（A,B,A,B）被检测到",
+        run_alt.finish_reason == FinishReason.LOOP_DETECTED.value,
+        run_alt.finish_reason,
+    )
+    check("交替循环没跑满 max_steps 就中止", run_alt.step_count < 10, f"steps={run_alt.step_count}")
+    check("交替循环仍产出收尾结论", bool(run_alt.final_answer), (run_alt.final_answer or "")[:40])
+
+    # 反向验证：正常的多步任务不能被误判成循环
+    # （只有在"严格周期重复"时才判——判太宽松会把正常任务误杀）
+    distinct_steps = [
+        {
+            "thought": f"查第 {i} 个订单",
+            "action": {"tool": "query_order", "args": {"order_id": f"ORD-0000{i:02d}"}},
+        }
+        for i in range(1, 7)
+    ] + [{"thought": "信息够了", "answer": "已汇总 6 个订单。"}]
+    rt = AgentRuntime(
+        ScriptedBrain(distinct_steps, repeat_last=False),
+        gw,
+        max_steps=12,
+        token_budget=99999,
+        loop_threshold=3,
+        trace_store=trace,
+    )
+    run_distinct = rt.run("批量查询 6 个订单", role=ROLE_READER, task_id="T-no-false-loop")
+    check(
+        "6 次互不相同的调用不会被误判为循环",
+        run_distinct.finish_reason == FinishReason.ANSWERED.value,
+        run_distinct.finish_reason,
+    )
+    check("6 次调用全部执行完", run_distinct.tool_calls == 6, f"tool_calls={run_distinct.tool_calls}")
 
     # ------------------------------------------------------------
     section("③ 步数超限：一直调不同工具")
@@ -157,6 +226,33 @@ def main() -> int:
     rt = AgentRuntime(bad_brain, gw, max_steps=5, token_budget=5000, trace_store=trace)
     run = rt.run("模糊任务", role=ROLE_READER, task_id="T-bad")
     check("标记为 no_action", run.finish_reason == FinishReason.NO_ACTION.value, run.finish_reason)
+
+    # ------------------------------------------------------------
+    section("⑦b 动作格式非法：不能崩，要优雅收尾")
+    # 原实现直接 `decision.action.get("tool", "")` ——
+    # 只要 action 不是 dict（真实 LLM 完全可能吐出字符串），
+    # 就会抛 AttributeError 把整个任务崩掉，而不是优雅收尾。
+    # 注意这和 ⑦ 是两种不同的失败：⑦ 是"什么都没给"，这里是"给了但格式不对"。
+    fmt_brain = ScriptedBrain([{"thought": "直接给个字符串", "action": "query_order"}], repeat_last=False)
+    rt = AgentRuntime(fmt_brain, gw, max_steps=6, token_budget=99999, trace_store=trace)
+    run_fmt = rt.run("非法动作", role=ROLE_READER, task_id="T-usage-error")
+    check(
+        "action 是字符串 → 判 usage_error（而不是抛 AttributeError 崩掉）",
+        run_fmt.finish_reason == FinishReason.USAGE_ERROR.value,
+        run_fmt.finish_reason,
+    )
+    check("非法动作也走优雅收尾（仍产出结论）", bool(run_fmt.final_answer), (run_fmt.final_answer or "")[:40])
+    check("非法动作没有真的执行任何工具", run_fmt.tool_calls == 0, f"tool_calls={run_fmt.tool_calls}")
+
+    # 另一种形态：action 是 dict，但 tool 字段是空的
+    null_brain = ScriptedBrain([{"thought": "tool 是空的", "action": {"tool": None}}], repeat_last=False)
+    rt = AgentRuntime(null_brain, gw, max_steps=6, token_budget=99999, trace_store=trace)
+    run_null = rt.run("tool 为空", role=ROLE_READER, task_id="T-usage-error2")
+    check(
+        "tool 字段为空 → 同样判 usage_error",
+        run_null.finish_reason == FinishReason.USAGE_ERROR.value,
+        run_null.finish_reason,
+    )
 
     # ------------------------------------------------------------
     section("⑧ 轨迹落盘与统计")
