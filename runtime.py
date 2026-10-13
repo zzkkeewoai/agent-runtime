@@ -110,7 +110,17 @@ class FinishReason(str, Enum):
 
 @dataclass
 class Step:
-    """一步轨迹（可回放的最小单位）"""
+    """一步轨迹（可回放的最小单位）
+
+    【回放需要什么，这里就记什么】—— 这三个字段是"让轨迹自包含"的关键，
+    没有它们，回放只能重放"大致过程"，而不是"完全一样的一次执行"：
+
+      · raw_action        模型这一轮**原始给出**的 action（可能非法、可能为空）。
+                          不记它就没法还原 usage_error / no_action 这类失败。
+      · tool_call_result  工具调用结果的**完整快照**（status / result / reason / approval_id）。
+                          只记 result 不够：reason 和 approval_id 会出现在渲染后的观察文本里，
+                          丢了它们，回放出来的观察就和原来不一样。
+    """
 
     index: int
     state: str
@@ -119,6 +129,8 @@ class Step:
     args: Optional[Dict[str, Any]] = None
     tool_status: Optional[str] = None
     observation: Optional[str] = None
+    raw_action: Any = None
+    tool_call_result: Optional[Dict[str, Any]] = None
     tokens: int = 0
     latency_ms: float = 0.0
 
@@ -140,6 +152,12 @@ class TaskRun:
     denied_calls: int = 0
     pending_approvals: int = 0
     created_at: str = ""
+    # ---------- 运行配置：回放必需 ----------
+    # 没有它就无法"用同样的约束条件"重跑一遍 —— 而约束不同，行为自然不同，
+    # 回放比对就失去意义了。轨迹必须自包含。
+    max_steps: int = 0
+    token_budget: int = 0
+    loop_threshold: int = 0
 
     @property
     def step_count(self) -> int:
@@ -278,6 +296,9 @@ class AgentRuntime:
                 state=AgentState.THINKING.value,
                 thought=decision.thought,
                 tokens=decision.tokens,
+                # 原样记下模型这一轮给的 action（哪怕是 None 或格式非法的字符串）——
+                # 回放时靠它还原"模型当时到底输出了什么"，否则 usage_error / no_action 无法重现
+                raw_action=decision.action,
             )
 
             # 预算检查（在动作之前判断，避免多花一次工具调用的成本）
@@ -344,6 +365,14 @@ class AgentRuntime:
             step.tool_name = tool_name
             step.args = args
             step.tool_status = result.status
+            # 记工具结果的**完整快照**（回放靠它还原文观察文本）
+            step.tool_call_result = {
+                "status": result.status,
+                "tool_name": result.tool_name,
+                "result": result.result,
+                "reason": result.reason,
+                "approval_id": result.approval_id,
+            }
 
             # ---------- OBSERVING：把结果转成观察 ----------
             observation = Observation(
@@ -387,6 +416,9 @@ class AgentRuntime:
             denied_calls=sum(1 for s in steps if s.tool_status == "denied"),
             pending_approvals=sum(1 for s in steps if s.tool_status == "pending_approval"),
             created_at=time.strftime("%Y-%m-%dT%H:%M:%S"),
+            max_steps=self.max_steps,
+            token_budget=self.token_budget,
+            loop_threshold=self.loop_threshold,
         )
 
         # ---------- 落盘（可回放） ----------
