@@ -67,6 +67,18 @@ class ToolCallResult:
     idempotency_key: str = ""
     approval_id: Optional[str] = None
 
+    # ---- 机制属性：回填给轨迹，供归因判断"保障机制有没有失效" ----
+    # 为什么这两个标志必须带进轨迹：
+    #   归因要判断"同一个幂等键是否被真实执行了两次"，但**非幂等工具的
+    #   重复执行是合法的**（比如每次调用都产生一条流水）。只看"键相同且都
+    #   executed"会把合法重复误报成幂等失效 —— 必须知道工具自己声明的策略。
+    #   side_effect 同理：判断"结果未知后重放"时要知道这个操作到底改不改状态。
+    #
+    # 默认值取 False（保守）：旧轨迹缺字段时归因**不判定失效**。
+    #   宁可漏报，不可误报 —— 误报多了人就不看报告了，那比漏报更糟。
+    idempotent: bool = False
+    side_effect: bool = False
+
     @property
     def ok(self) -> bool:
         return self.status in ("executed", "cached")
@@ -457,6 +469,10 @@ class ToolGateway:
             reason=reason,
             audit_id=audit_id,
             idempotency_key=idem_key,
+            # 把机制属性一起带出去 —— runtime 会把它们写进轨迹快照，
+            # 归因层靠它区分"幂等生效"和"幂等失效"
+            idempotent=spec.idempotent,
+            side_effect=spec.side_effect,
         )
 
     @staticmethod

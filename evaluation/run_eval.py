@@ -182,6 +182,44 @@ def print_attribution(rows):
             print(f"    → {a.fix_hint}")
 
 
+def print_mechanism_health(rows) -> None:
+    """机制健康度 —— 单独一节，和「归因分布」分开看。
+
+    为什么必须单独一节：
+        「归因分布」回答的是"任务为什么没完成"，里面混着
+        **"系统正确拦住了违规"这种好消息**（比如 permission_denied 1 条，
+        其实是系统工作正常的证据）。
+
+        而「机制失效」回答的是"我们承诺的保障有没有失效"——
+        它的**正常值就是 0**，非 0 一定是 bug。
+
+        两者混在一张表里，警报会被淹没在正常的失败项里看不出来。
+    """
+    items = [r["attribution"] for r in rows]
+    stat = attr_mod.mechanism_failure_rate(items)
+
+    print()
+    print("=" * 84)
+    print("机制健康度（正常值应为 0 —— 非 0 说明保障机制失效）")
+    print("=" * 84)
+    print(f"  样本数            {stat['total']}")
+    print(f"  机制失效数        {stat['mechanism_failures']}")
+    print(f"  机制失效率        {stat['rate']:.2%}")
+
+    if stat["mechanism_failures"]:
+        print("\n  按类别：")
+        for cat, n in stat["by_category"].items():
+            print(f"    {cat:<28} {n}")
+            print(f"      → {attr_mod.FIX_HINT[attr_mod.Attribution(cat)]}")
+        print("\n  ⚠️ 机制失效意味着「我们承诺的保障没生效」，")
+        print("     它的优先级高于任何一条任务失败 —— 任务失败可能只是任务难，")
+        print("     机制失效一定是系统有 bug。")
+    else:
+        print("\n  所有用例中，四项保障机制均未失效：")
+        print("    幂等 / 结果未知后的恢复 / 状态机 / 循环检测")
+    print("=" * 84)
+
+
 def main() -> int:
     cases = load_jsonl(os.path.join(DATA_DIR, "eval_tasks.jsonl"))
 
@@ -235,6 +273,7 @@ def main() -> int:
     print_case_results(rows)
     print_metrics(rows)
     print_attribution(rows)
+    print_mechanism_health(rows)
 
     print("\n" + "=" * 84)
     print(f"轨迹落盘: {TRACE_PATH}")

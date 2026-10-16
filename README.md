@@ -199,7 +199,9 @@ python tests/ab_experiment.py
 
 ### 3. 任务评测 + 失败归因（`evaluation/`）
 
-**归因九分类**（按严重程度排序，安全问题永远优先报）：
+**归因十三分类** —— 分成两组，这个划分是整个归因模块的钥匙：
+
+**A 组：现象（任务为什么没完成）**
 
 | 归因 | 含义 | 该改哪里 |
 |---|---|---|
@@ -213,7 +215,34 @@ python tests/ab_experiment.py
 | NO_ACTION | 既不动手也不作答 | 检查工具描述清晰度 |
 | PLANNING_ERROR | 期望工具没被调用 | 优化规划提示 |
 
+**B 组：机制失效（我们承诺的保障，哪个没拦住）**
+
+| 归因 | 含义 | 该改哪里 |
+|---|---|---|
+| IDEMPOTENCY_FAILURE | 同一个幂等键被**真实执行两次以上** | 检查键构成 / 是否先查账本再执行 / 多实例原子性 |
+| RECOVERY_FAILURE | 结果未知后**未经状态查询就直接重放** | 重试前先按幂等键查状态；查不到要退避重查，仍未知转人工 |
+| STATE_TRANSITION_ERROR | 状态机被破坏（瞬态落盘 / 调用与观察不成对 / 终态后还有步骤） | 检查收尾路径有没有漏写状态 |
+| LOOP_DETECTION_FAILURE | 有明显重复模式（`A,A,A` 或 `A,B,A,B`），但循环检测没触发 | 判据是否覆盖交替循环、`loop_threshold` 是否配得过大 |
+
+**为什么必须拆成两组**（这是评测一个"可靠性系统"和评测一个"功能系统"的根本区别）：
+
+> A 组里的"失败"**不一定是坏消息**。成功拦住一次越权退款，在 A 组看是
+> `PERMISSION_DENIED`（任务没完成），实际上是系统**正确工作**。
+>
+> 真正要修的 bug 在 B 组：**我们承诺的保障失效了**。
+> "重复退款被幂等拦住"是好消息，"幂等没拦住导致扣了两次钱"才是坏消息 ——
+> 这两件事在 A 组里长得一模一样，只有 B 组能把它们分开。
+
+**机制失效率**：B 组的一个衍生指标，**正常值就是 0，非 0 一定是 bug**。
+`run_eval.py` 会单独打一节「机制健康度」，不和归因分布混在一张表里 ——
+否则警报会被淹没在 `permission_denied 1 条`这种正常结果里。
+
 **为什么用确定性规则（不调 LLM）**：归因本身必须**可靠、可复现、零成本**。LLM 归因适合做补充，不能做主力。
+
+**判定优先级只有一处**：`attribute()` 里的检查顺序和 `SEVERITY_ORDER` 那张表**必须一一对应**。
+这里踩过一次 —— 最初把"幂等失效"写在"策略违规"之前，和表里的顺序矛盾了：
+**两处各写一份优先级，是这类代码最典型的 bug**（改了一处忘了另一处）。
+所以测试里有专门的优先级断言守着它（`tests/test_attribution_mechanism.py` ⑤）。
 
 ---
 
@@ -328,7 +357,10 @@ python tests/test_runtime.py
 python tests/test_replay.py
 python replay.py
 
-# 4. 任务级评测 + 归因（10 条任务）
+# 5. 机制失效归因（四类保障机制：幂等 / 未知恢复 / 状态机 / 循环检测）
+python tests/test_attribution_mechanism.py
+
+# 6. 任务级评测 + 归因（10 条任务；报告末尾单列「机制健康度」）
 python evaluation/run_eval.py
 ```
 
@@ -372,8 +404,11 @@ agent_runtime/
 │   ├── audit.jsonl         审计记录（每次调用的决策与原因）
 │   └── traces.jsonl        任务轨迹（可回放）
 └── tests/
-    ├── test_gateway.py     25 项断言
-    └── test_runtime.py     24 项断言
+    ├── test_gateway.py              25 项断言
+    ├── test_runtime.py              40 项断言
+    ├── test_replay.py               11 项断言（含篡改检测）
+    ├── test_attribution_mechanism.py 31 项断言（四类机制失效 + 反向验证 + 优先级）
+    └── ab_experiment.py             A/B 对照实验
 ```
 
 ## 八、技术栈

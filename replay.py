@@ -93,6 +93,12 @@ class ReplayGateway:
             result=snap.get("result"),
             reason=snap.get("reason", ""),
             approval_id=snap.get("approval_id"),
+            # 机制属性也要透传：回放出来的轨迹必须是"完整再现"。
+            # 少了这三个字段，在回放轨迹上跑归因会得到和原始轨迹不同的结论
+            # （幂等失效检测依赖 idempotency_key + idempotent）。
+            idempotency_key=snap.get("idempotency_key", ""),
+            idempotent=snap.get("idempotent", False),
+            side_effect=snap.get("side_effect", False),
         )
 
 

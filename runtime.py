@@ -365,13 +365,20 @@ class AgentRuntime:
             step.tool_name = tool_name
             step.args = args
             step.tool_status = result.status
-            # 记工具结果的**完整快照**（回放靠它还原文观察文本）
+            # 记工具结果的**完整快照**（回放靠它还原文观察文本；
+            # 归因靠它判断机制有没有失效）
             step.tool_call_result = {
                 "status": result.status,
                 "tool_name": result.tool_name,
                 "result": result.result,
                 "reason": result.reason,
                 "approval_id": result.approval_id,
+                # 机制属性：归因层要判断"同一个幂等键是否被真实执行了两次"，
+                # 但只有**幂等工具**的重复执行才叫失效 —— 所以必须把
+                # 工具声明的 idempotent 一起记下来，否则无法区分。
+                "idempotency_key": result.idempotency_key,
+                "idempotent": result.idempotent,
+                "side_effect": result.side_effect,
             }
 
             # ---------- OBSERVING：把结果转成观察 ----------
